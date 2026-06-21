@@ -312,6 +312,69 @@ fn write_po(
     Ok(())
 }
 
+/// Rewrite a leaked `msgstr` block in place: overwrite the `msgstr` keyword line at
+/// `msgstr_line` with `replacement`, then blank every following continuation line
+/// (`"..."`) that belongs to the same block.
+///
+/// The continuation lines must be cleared, not just the keyword line. `parse_po`
+/// re-appends any leftover `"..."` lines onto the msgstr on the post-repair re-parse
+/// (its `trimmed.starts_with('"')` branch), so leaving them behind keeps a blanked
+/// (Unrecoverable) entry non-empty — it is then skipped by the `msgstr.is_empty()`
+/// re-translate filter and the leaked text ships to disk — or concatenates the
+/// leaked text onto a Recovered translation. Mirrors the continuation-line skipping
+/// in `write_po`.
+///
+/// The lines are blanked rather than removed so that line indices stay stable: the
+/// `translations` map and the re-parse that follow are keyed by line position.
+fn clear_msgstr_block(lines: &mut [String], msgstr_line: usize, replacement: String) {
+    lines[msgstr_line] = replacement;
+    let mut i = msgstr_line + 1;
+    while i < lines.len() && lines[i].trim_start().starts_with('"') {
+        lines[i].clear();
+        i += 1;
+    }
+}
+
+/// Repair entries whose `msgstr` is a leaked prompt rather than a translation: rewrite
+/// `lines` in place (recovered text, or blanked for re-translation) and drop any stale
+/// `translations` entry the trailing-`\n` repair pass pre-seeded for the repaired line.
+///
+/// The stale-key drop matters because `write_po` prefers `translations` over `lines`: a
+/// Recovered entry is never re-translated, so a leftover pre-seeded value would win and
+/// re-ship the leak; an Unrecoverable entry whose later re-translation fails would do the
+/// same. Returns `(recovered, blanked)` counts.
+fn repair_leaks(
+    entries: &[Entry],
+    lines: &mut [String],
+    translations: &mut HashMap<usize, String>,
+) -> (usize, usize) {
+    let mut recovered = 0;
+    let mut blanked = 0;
+    for entry in entries {
+        if entry.msgstr.is_empty() {
+            continue;
+        }
+        match check_for_leak(&entry.msgid, &entry.msgstr) {
+            LeakCheck::Clean => {}
+            LeakCheck::Recovered(r) => {
+                clear_msgstr_block(
+                    lines,
+                    entry.msgstr_line,
+                    format!("msgstr \"{}\"", encode_po_string(&r)),
+                );
+                translations.remove(&entry.msgstr_line);
+                recovered += 1;
+            }
+            LeakCheck::Unrecoverable => {
+                clear_msgstr_block(lines, entry.msgstr_line, "msgstr \"\"".to_string());
+                translations.remove(&entry.msgstr_line);
+                blanked += 1;
+            }
+        }
+    }
+    (recovered, blanked)
+}
+
 /// Strip wrapping characters the model added that weren't present in the source.
 ///
 /// Handles the common failure modes observed in logs: a whole translation wrapped in
@@ -406,25 +469,8 @@ async fn main() -> anyhow::Result<()> {
     // Repair entries where the model previously leaked its instructions instead of translating.
     // Recover the real translation from the response tail when possible, otherwise clear to ""
     // so the entry gets re-translated on this run.
-    let mut leak_recovered = 0;
-    let mut leak_blanked = 0;
     let mut lines: Vec<String> = lines;
-    for entry in &entries {
-        if entry.msgstr.is_empty() {
-            continue;
-        }
-        match check_for_leak(&entry.msgid, &entry.msgstr) {
-            LeakCheck::Clean => {}
-            LeakCheck::Recovered(r) => {
-                lines[entry.msgstr_line] = format!("msgstr \"{}\"", encode_po_string(&r));
-                leak_recovered += 1;
-            }
-            LeakCheck::Unrecoverable => {
-                lines[entry.msgstr_line] = "msgstr \"\"".to_string();
-                leak_blanked += 1;
-            }
-        }
-    }
+    let (leak_recovered, leak_blanked) = repair_leaks(&entries, &mut lines, &mut translations);
     if leak_recovered + leak_blanked > 0 {
         println!(
             "==> Leak repair: {leak_recovered} recovered, {leak_blanked} cleared for re-translation"
@@ -529,4 +575,130 @@ async fn main() -> anyhow::Result<()> {
         translations.len()
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn to_lines(s: &str) -> Vec<String> {
+        s.lines().map(str::to_owned).collect()
+    }
+
+    /// A leaked `msgstr` that spans the keyword line plus two continuation lines —
+    /// the multi-line shape the leak-repair path must fully clear.
+    const MULTILINE_LEAK: &str = concat!(
+        "msgid \"Save\"\n",
+        "msgstr \"\"\n",
+        "\"- You translate English technical documentation strings.\\n\"\n",
+        "\"- Do not translate brand names.\\n\"\n",
+    );
+
+    /// Characterizes the bug: rewriting only the `msgstr` keyword line leaves the
+    /// continuation lines behind, and `parse_po` re-appends them — so the entry is
+    /// NOT empty on re-parse. This is the behavior `clear_msgstr_block` exists to fix.
+    #[test]
+    fn rewriting_only_keyword_line_leaves_leaked_text() {
+        let mut lines = to_lines(MULTILINE_LEAK);
+        let msgstr_line = parse_po(&lines)[0].msgstr_line;
+
+        lines[msgstr_line] = "msgstr \"\"".to_string(); // keyword line only (buggy)
+
+        let reparsed = parse_po(&lines);
+        assert_eq!(reparsed.len(), 1);
+        assert!(
+            !reparsed[0].msgstr.is_empty(),
+            "leaked continuation lines survive a keyword-only rewrite"
+        );
+        assert!(reparsed[0].msgstr.contains("You translate"));
+    }
+
+    /// Unrecoverable repair: clearing the whole block makes the re-parsed `msgstr`
+    /// truly empty, so the entry is re-queued by the `msgstr.is_empty()` filter
+    /// instead of silently shipping the leaked instruction text.
+    #[test]
+    fn clear_msgstr_block_blanks_unrecoverable_leak() {
+        let mut lines = to_lines(MULTILINE_LEAK);
+        let msgstr_line = parse_po(&lines)[0].msgstr_line;
+
+        clear_msgstr_block(&mut lines, msgstr_line, "msgstr \"\"".to_string());
+
+        let reparsed = parse_po(&lines);
+        assert_eq!(reparsed.len(), 1);
+        assert!(
+            reparsed[0].msgstr.is_empty(),
+            "msgstr must be empty after clearing the leaked block; got {:?}",
+            reparsed[0].msgstr
+        );
+    }
+
+    /// A leak long enough to trip `check_for_leak`'s `too_long` guard, with the real
+    /// translation (`保存`) as the final paragraph after a blank line so it is Recovered.
+    const RECOVERABLE_LEAK: &str = concat!(
+        "msgid \"Save\"\n",
+        "msgstr \"\"\n",
+        "\"- You translate English technical documentation strings to Japanese.\\n\"\n",
+        "\"- Do not translate brand names, command names, CLI flags, or file paths.\\n\"\n",
+        "\"\\n\"\n",
+        "\"保存\"\n",
+    );
+
+    /// Regression for the trailing-`\n` repair + leak recovery interaction, driving the
+    /// real `repair_leaks` path. The trailing-`\n` pass pre-seeds
+    /// `translations[msgstr_line]` with the (still leaked) text; `write_po` prefers
+    /// `translations` over `lines`, and a Recovered leak is never re-translated. Unless
+    /// `repair_leaks` drops that stale key, `write_po` re-ships the leak. Asserts the
+    /// recovered text wins end-to-end through `write_po`.
+    #[test]
+    fn repair_leaks_drops_stale_translations_key() {
+        let mut lines = to_lines(RECOVERABLE_LEAK);
+        let entries = parse_po(&lines);
+        let msgstr_line = entries[0].msgstr_line;
+
+        // Simulate the trailing-\n repair pass having pre-seeded the leaked text.
+        let mut translations: HashMap<usize, String> = HashMap::new();
+        translations.insert(msgstr_line, format!("{}\n", entries[0].msgstr));
+
+        let (recovered, blanked) = repair_leaks(&entries, &mut lines, &mut translations);
+        assert_eq!((recovered, blanked), (1, 0), "entry must be Recovered");
+        assert!(
+            !translations.contains_key(&msgstr_line),
+            "stale trailing-\\n key must be dropped by repair_leaks"
+        );
+
+        let path =
+            std::env::temp_dir().join(format!("fill_tr_stale_key_{}.po", std::process::id()));
+        write_po(&lines, RECOVERABLE_LEAK, &translations, &[], &[], &path).unwrap();
+        let out = std::fs::read_to_string(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        assert!(
+            out.contains("保存"),
+            "recovered text must be written; got:\n{out}"
+        );
+        assert!(
+            !out.contains("You translate"),
+            "stale leaked text must not ship; got:\n{out}"
+        );
+    }
+
+    /// Recovered repair: the re-parsed `msgstr` equals exactly the recovered text,
+    /// with none of the leaked continuation lines concatenated onto it.
+    #[test]
+    fn clear_msgstr_block_keeps_only_recovered_text() {
+        let mut lines = to_lines(MULTILINE_LEAK);
+        let msgstr_line = parse_po(&lines)[0].msgstr_line;
+        let recovered = "保存";
+
+        clear_msgstr_block(
+            &mut lines,
+            msgstr_line,
+            format!("msgstr \"{}\"", encode_po_string(recovered)),
+        );
+
+        let reparsed = parse_po(&lines);
+        assert_eq!(reparsed.len(), 1);
+        assert_eq!(reparsed[0].msgstr, recovered);
+        assert!(!reparsed[0].msgstr.contains("You translate"));
+    }
 }
