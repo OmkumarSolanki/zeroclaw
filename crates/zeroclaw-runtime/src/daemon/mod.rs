@@ -872,14 +872,21 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
             None
         };
 
-        // Create memory once per tick for recall + consolidation.
+        // Create memory once per tick for recall + consolidation. Use the
+        // routes-aware factory with the provider catalog so `[[embedding_routes]]`
+        // (and dotted `model_provider` refs) resolve here exactly as on the
+        // gateway/RPC paths — otherwise heartbeat recall would silently fall
+        // back to keyword-only for hint-routed embeddings.
         let heartbeat_memory: Option<Box<dyn zeroclaw_memory::Memory>> =
-            zeroclaw_memory::create_memory(
+            zeroclaw_memory::create_memory_with_storage_and_routes(
                 &config.memory,
+                &config.embedding_routes,
+                config.resolve_active_storage(),
                 &config.data_dir,
                 config
                     .model_provider_for_agent(&agent_alias)
                     .and_then(|e| e.api_key.as_deref()),
+                Some(&config.providers.models),
             )
             .ok();
 

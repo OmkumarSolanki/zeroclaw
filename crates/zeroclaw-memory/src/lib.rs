@@ -322,13 +322,15 @@ fn resolve_embedding_config(
 /// Resolution maps the dotted ref to the referenced profile's concrete
 /// endpoint and key:
 ///   - an explicit `uri` override becomes `custom:<uri>`;
-///   - otherwise the bare provider kind (`openai` / `openrouter`) is passed
-///     through so the factory applies its built-in family default endpoint.
+///   - with no `uri`, an `openai` / `openrouter` family passes through so the
+///     factory applies its built-in family default endpoint.
 ///
 /// Non-dotted providers (`openai`, `openrouter`, `custom:<url>`, `none`, or any
-/// empty/literal value) are returned unchanged. A dotted ref that cannot be
-/// resolved (no catalog, or the profile is missing from `providers.models`) is
-/// left intact but logged loudly, so the degradation is never silent.
+/// empty/literal value) are returned unchanged. A dotted ref is logged loudly
+/// and left unresolved — never silently degraded — when it cannot be resolved
+/// (no catalog, or missing from `providers.models`) OR when it resolves to a
+/// family with no usable embeddings endpoint (a non-`openai`/`openrouter`
+/// family configured without a `uri`).
 ///
 /// Key precedence: `explicit_api_key` (per-route / `[memory]` override) wins,
 /// then the referenced profile's own key, then `inherited_api_key` (the chat
@@ -362,7 +364,10 @@ fn resolve_provider_ref(
             WARN,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                 .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                .with_attrs(::serde_json::json!({"provider_ref": reference})),
+                .with_attrs(::serde_json::json!({
+                    "error_key": "memory.embedding_route_unresolved",
+                    "provider_ref": reference,
+                })),
             "Embedding provider reference did not resolve against providers.models; \
              embeddings disabled (keyword-only) for this profile"
         );
@@ -380,16 +385,44 @@ fn resolve_provider_ref(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_string);
-    // `uri` is the full endpoint override; when unset the factory's built-in
-    // family default for the bare kind is used instead of re-deriving it here.
+    // Map the resolved profile to a form the embeddings factory understands.
+    // An explicit `uri` becomes `custom:<uri>` (works for any OpenAI-compatible
+    // endpoint). With no `uri`, only `openai` / `openrouter` have a built-in
+    // default endpoint in the factory; any other resolved family has no
+    // embeddings endpoint to hit, so we must NOT pass its bare name through —
+    // that would silently fall back to `NoopEmbedding`. Report it loudly
+    // instead, leaving the reference unresolved (keyword-only), so a configured
+    // route never degrades in silence (issue #7949).
     let concrete_provider = match provider_cfg
         .uri
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty())
     {
-        Some(uri) => format!("custom:{uri}"),
-        None => kind.to_string(),
+        Some(uri) => Some(format!("custom:{uri}")),
+        None if matches!(kind, "openai" | "openrouter") => Some(kind.to_string()),
+        None => None,
+    };
+    let Some(concrete_provider) = concrete_provider else {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(::serde_json::json!({
+                    "error_key": "memory.embedding_route_no_endpoint",
+                    "provider_ref": reference,
+                    "provider_kind": kind,
+                })),
+            "Embedding provider reference resolved but has no usable embeddings \
+             endpoint (set its `uri`, or point the route at an openai/openrouter \
+             compatible profile); embeddings disabled (keyword-only) for this profile"
+        );
+        return ResolvedEmbeddingConfig {
+            model_provider,
+            model,
+            dimensions,
+            api_key: explicit_api_key.or(inherited_api_key),
+        };
     };
 
     ResolvedEmbeddingConfig {
@@ -1326,5 +1359,78 @@ mod tests {
 
         assert_eq!(resolved.model_provider, "custom:https://api.example.com/v1");
         assert_eq!(resolved.api_key.as_deref(), Some("sk-provider"));
+    }
+
+    #[test]
+    fn resolve_embedding_config_resolved_family_without_endpoint_is_not_silent() {
+        let cfg = MemoryConfig {
+            embedding_provider: "none".into(),
+            embedding_model: "hint:semantic".into(),
+            embedding_dimensions: 1536,
+            ..MemoryConfig::default()
+        };
+        let routes = vec![EmbeddingRouteConfig {
+            hint: "semantic".into(),
+            model_provider: "custom.myembed".into(),
+            model: "text-embedding-3-small".into(),
+            dimensions: Some(1024),
+            api_key: None,
+        }];
+        // The ref RESOLVES (the `custom.myembed` profile exists) but carries no
+        // `uri`, and `custom` has no built-in embeddings endpoint — so there is
+        // no concrete form for the factory.
+        let providers = catalog_with("custom", "myembed", None, Some("sk-provider"));
+
+        let resolved =
+            resolve_embedding_config(&cfg, &routes, Some("chat-provider-key"), Some(&providers));
+
+        // It must NOT be rewritten to a bare `custom` (which would silently
+        // Noop); it is left unresolved and logged loudly. The end-to-end
+        // embedder is the keyword-only Noop, surfaced rather than hidden.
+        assert_eq!(resolved.model_provider, "custom.myembed");
+        let embedder = embeddings::create_embedding_provider(
+            &resolved.model_provider,
+            resolved.api_key.as_deref(),
+            &resolved.model,
+            resolved.dimensions,
+        );
+        assert_eq!(embedder.name(), "none");
+    }
+
+    #[test]
+    fn resolve_embedding_config_custom_family_with_uri_resolves() {
+        let cfg = MemoryConfig {
+            embedding_provider: "none".into(),
+            embedding_model: "hint:semantic".into(),
+            embedding_dimensions: 1536,
+            ..MemoryConfig::default()
+        };
+        let routes = vec![EmbeddingRouteConfig {
+            hint: "semantic".into(),
+            model_provider: "custom.myembed".into(),
+            model: "text-embedding-3-small".into(),
+            dimensions: Some(1024),
+            api_key: None,
+        }];
+        // A `custom` profile WITH an explicit `uri` is a fully usable
+        // OpenAI-compatible endpoint.
+        let providers = catalog_with(
+            "custom",
+            "myembed",
+            Some("https://embed.local/v1"),
+            Some("sk-local"),
+        );
+
+        let resolved = resolve_embedding_config(&cfg, &routes, None, Some(&providers));
+
+        assert_eq!(resolved.model_provider, "custom:https://embed.local/v1");
+        assert_eq!(resolved.api_key.as_deref(), Some("sk-local"));
+        let embedder = embeddings::create_embedding_provider(
+            &resolved.model_provider,
+            resolved.api_key.as_deref(),
+            &resolved.model,
+            resolved.dimensions,
+        );
+        assert_eq!(embedder.name(), "openai");
     }
 }
