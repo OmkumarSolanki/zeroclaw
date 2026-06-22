@@ -3885,20 +3885,30 @@ async fn main() -> Result<()> {
             match daemon::detect_gateway_bind_mode(&current_config, &host, port).await {
                 daemon::GatewayBindMode::StartFresh => {}
                 daemon::GatewayBindMode::GatewayAlreadyRunning => {
-                    anyhow::bail!(
-                        "A ZeroClaw gateway is already running on {host}:{port}. The daemon \
-                         supervises its own gateway and will not start a second one on the \
-                         same address. Stop that gateway (or point the daemon at a free port \
-                         with `zeroclaw config set gateway.port <port>`), then run the daemon \
-                         again."
-                    );
+                    let port = port.to_string();
+                    anyhow::bail!(ta(
+                        "cli-daemon-gateway-already-running",
+                        &[("host", host.as_str()), ("port", port.as_str())],
+                        &format!(
+                            "A ZeroClaw gateway is already running on {host}:{port}. The daemon \
+                             supervises its own gateway and will not start a second one on the \
+                             same address. Stop that gateway (or point the daemon at a free port \
+                             with `zeroclaw config set gateway.port <port>`), then run the daemon \
+                             again."
+                        ),
+                    ));
                 }
                 daemon::GatewayBindMode::PortOccupied => {
-                    anyhow::bail!(
-                        "Gateway address {host}:{port} is already in use by another process. \
-                         Free the port or point the daemon at a free port (`zeroclaw config \
-                         set gateway.port <port>`), then run the daemon again."
-                    );
+                    let port = port.to_string();
+                    anyhow::bail!(ta(
+                        "cli-daemon-gateway-port-occupied",
+                        &[("host", host.as_str()), ("port", port.as_str())],
+                        &format!(
+                            "Gateway address {host}:{port} is already in use by another process. \
+                             Free the port or point the daemon at a free port (`zeroclaw config \
+                             set gateway.port <port>`), then run the daemon again."
+                        ),
+                    ));
                 }
             }
 

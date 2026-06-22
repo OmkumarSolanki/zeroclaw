@@ -286,18 +286,48 @@ pub async fn detect_gateway_bind_mode(config: &Config, host: &str, port: u16) ->
         return GatewayBindMode::StartFresh;
     };
 
-    match tokio::net::TcpListener::bind(addr).await {
+    classify_gateway_bind_outcome(
+        tokio::net::TcpListener::bind(addr).await,
+        config,
+        host,
+        port,
+    )
+    .await
+}
+
+/// Map the throwaway bind result to a `GatewayBindMode`.
+///
+/// Only `AddrInUse` is a genuine conflict worth failing fast over. Any other
+/// bind error — e.g. `EACCES`/`PermissionDenied` on a privileged port (<1024)
+/// when the daemon is not root — is *not* a "port occupied" condition: the
+/// address may well be free. Treating it as occupied would misreport the cause
+/// (and `zeroclaw_gateway_responds` would return `false` since nothing is
+/// listening, yielding the wrong "another process" message). For those we defer
+/// to the supervised gateway's own bind to surface the real error, which
+/// restores the pre-#7895 behaviour for that case.
+///
+/// Split out from `detect_gateway_bind_mode` so the non-`AddrInUse` branch is
+/// unit-testable without having to provoke a real privileged-port bind failure
+/// (which is environment-dependent: it succeeds as root, fails as non-root).
+async fn classify_gateway_bind_outcome(
+    bind: std::io::Result<tokio::net::TcpListener>,
+    config: &Config,
+    host: &str,
+    port: u16,
+) -> GatewayBindMode {
+    match bind {
         Ok(listener) => {
             drop(listener);
             GatewayBindMode::StartFresh
         }
-        Err(_) => {
+        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
             if zeroclaw_gateway_responds(config, host, port).await {
                 GatewayBindMode::GatewayAlreadyRunning
             } else {
                 GatewayBindMode::PortOccupied
             }
         }
+        Err(_) => GatewayBindMode::StartFresh,
     }
 }
 
@@ -2387,6 +2417,28 @@ mod tests {
             detect_gateway_bind_mode(&Config::default(), "127.0.0.1", port).await,
             GatewayBindMode::PortOccupied,
             "a non-2xx /health on an occupied port fails fast as a foreign occupant"
+        );
+    }
+
+    #[tokio::test]
+    async fn detect_gateway_bind_mode_defers_on_non_addr_in_use_error() {
+        // A non-AddrInUse bind failure (e.g. EACCES on a privileged port when
+        // the daemon is not root) is NOT a "port occupied" condition: the
+        // address may be free. Classify it as StartFresh so the supervised
+        // gateway's own bind surfaces the real error, rather than misreporting
+        // the port as in use by another process. Injected directly because the
+        // error is environment-dependent (it would succeed as root in CI).
+        let outcome = classify_gateway_bind_outcome(
+            Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
+            &Config::default(),
+            "0.0.0.0",
+            80,
+        )
+        .await;
+        assert_eq!(
+            outcome,
+            GatewayBindMode::StartFresh,
+            "a non-AddrInUse bind error must defer to the gateway's own bind, not fail fast"
         );
     }
 }
